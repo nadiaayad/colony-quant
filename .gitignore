@@ -1,0 +1,16 @@
+# Ignore Mac system files
+.DS_Store
+
+# Ignore large data and model weights
+*.tif
+*.tiff
+*.nd2
+*.pt
+*.pth
+
+# Ignore Python caches
+__pycache__/
+.ipynb_checkpoints/
+
+# Explicitly ignore Box Drive sync paths
+Box-Box/

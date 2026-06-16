@@ -1,0 +1,13 @@
+python==3.10 
+numpy==1.26.4
+scipy==1.12.0
+opencv-python
+matplotlib
+pandas
+scikit-image
+cellpose
+ultralytics
+aicsimageio
+pytorch
+torchvision
+tqdm
