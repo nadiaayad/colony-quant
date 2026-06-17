@@ -27,7 +27,7 @@ def plot_diagnostic_grid(img_name, raw_outline, raw_quant, raw_nuc, mask_outline
 
     # Set up the 2x3 grid
     fig, axes = plt.subplots(2, 3, figsize=(12, 6))
-    fig.suptitle(f"QC Dashboard: {img_name}", fontsize=12, fontweight='bold')
+    fig.suptitle(f"QC Dashboard: {img_name}", fontsize=6, fontweight='bold')
     
     # --- ROW 1: Raw Images with Auto-Contrast ---
     axes[0, 0].imshow(apply_display_contrast(fast_resize(raw_outline)), cmap='gray')

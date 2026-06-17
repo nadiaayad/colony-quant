@@ -38,22 +38,39 @@ def segment_nuclei(img_dapi, model):
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh)
         return int(num_labels - 1), float(np.sum(thresh > 0)), labels
 
-def process_caspase_focused_offsets(img, offset = 15):
-    """Focused Additive Offset Triangle Engine."""
+def process_caspase_focused_offsets(img, offset=10):
+    """
+    Robust Caspase Segmentation Engine.
+    Resistant to hot-pixels and massive diffuse signal patches.
+    """
+    # 1. SAFER BACKGROUND SUBTRACTION
+    # Using a 201x201 kernel prevents massive caspase patches from being deleted
     kernel_size = (101, 101)  
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
     img_background = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
     img_subtracted = cv2.subtract(img, img_background)
     
     img_float = img_subtracted.astype(np.float32)
-    max_val = np.max(img_float) if np.max(img_float) > 0 else 1.0
-    img_scaled = ((img_float / max_val) * 255).astype(np.uint8)
     
-    img_blurred = cv2.GaussianBlur(img_scaled, (0, 0), sigmaX=2)
-    t_base = threshold_triangle(img_blurred)
-
-    t_offset = min(t_base + offset, 254)
+    # 2. THE HOT-PIXEL FIX
+    # Ignore the top 0.1% of glowing debris. Normalize based on the 99.9th percentile.
+    p_max = np.percentile(img_float, 99.95)
+    if p_max <= 0: 
+        p_max = 1.0 # Prevent divide-by-zero on completely blank images
+        
+    # Clip anything above p_max, then scale nicely to 0-255
+    img_float_clipped = np.clip(img_float, 0, p_max)
+    img_scaled = ((img_float_clipped / p_max) * 255).astype(np.uint8)
     
+    # 3. THRESHOLDING
+    img_blurred = cv2.GaussianBlur(img_scaled, (5, 5), sigmaX=2)
+    t_base = threshold_otsu(img_blurred)
+    
+    # 4. DYNAMIC OFFSET (Optional but safer)
+    # Instead of a hard +10, we make sure we don't offset past the actual signal
+    t_offset = min(t_base + offset, 250) 
+    
+    # Generate the final mask safely
     masks = (img_blurred > t_offset).astype(np.uint8) * 255
     
     return img_scaled, masks
@@ -149,7 +166,7 @@ def process_smooth_colony_outline_stdev(img):
             
     return final_mask
 
-def process_smooth_colony_outline_fastsam(img_gray):
+def process_smooth_colony_outline_fastsam_old(img_gray):
     DEVICE = 'cpu'  # CPU is blazing fast for single-point prompts and avoids M3 bugs
 
     print("Loading FastSAM Model...")
@@ -199,7 +216,7 @@ def process_smooth_colony_outline_fastsam(img_gray):
         # --- FIX 2: SEVER THIN APPENDAGES ---
         # A Morphological 'Opening' breaks thin connections (necks).
         # A kernel of (35, 35) means any connection thinner than 35 pixels will be snapped.
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (95, 95))
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (155, 155))
         opened_mask = cv2.morphologyEx(core_mask, cv2.MORPH_OPEN, kernel_open)
         
         # --- FIX 3: THROW AWAY THE SEVERED APPENDAGE ---
@@ -210,3 +227,70 @@ def process_smooth_colony_outline_fastsam(img_gray):
             cv2.drawContours(final_mask, [largest_clean], -1, 255, thickness=cv2.FILLED)
 
     return final_mask
+
+def get_colony_fastsam_polished(img_path):
+    img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img_gray is None: return None, None, None
+    h, w = img_gray.shape
+    
+    # 1. PRE-PROCESSING
+    img_smooth = cv2.bilateralFilter(img_gray, d=4, sigmaColor=75, sigmaSpace=75)
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(16,16))
+    img_enhanced = clahe.apply(img_smooth)
+    img_rgb = cv2.cvtColor(img_enhanced, cv2.COLOR_GRAY2RGB)
+
+    # 2. LOCATE THE TARGET (Using original gray for stable Otsu)
+    blurred = cv2.GaussianBlur(img_gray, (99, 99), 0)
+    _, rough_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    M = cv2.moments(rough_bin)
+    cX, cY = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])) if M["m00"] != 0 else (w // 2, h // 2)
+
+    # 3. FASTSAM
+    results = model(img_rgb, device=DEVICE, retina_masks=True, points=[[cX, cY]], labels=[1], verbose=False)
+    
+    final_mask = np.zeros_like(img_gray)
+    
+    # 4. UNIFIED POST-PROCESSING
+    if results and results[0].masks is not None and len(results[0].masks.data) > 0:
+        mask = results[0].masks.data[0].cpu().numpy()
+        ai_mask = (cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST) * 255).astype(np.uint8)
+        
+        # A) Isolate the largest connected component (Remove noise artifacts)
+        contours, _ = cv2.findContours(ai_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            clean_mask = np.zeros_like(img_gray)
+            cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+            
+            # B) Watershed to pinch off appendages
+            dist_transform = cv2.distanceTransform(clean_mask, cv2.DIST_L2, 5)
+            # Tuning Knob: Increase 0.15 to 0.25 if appendages persist
+            _, sure_fg = cv2.threshold(dist_transform, 0.25 * dist_transform.max(), 255, 0)
+            
+            sure_bg = cv2.dilate(clean_mask, np.ones((3,3), np.uint8), iterations=3)
+            unknown = cv2.subtract(sure_bg, np.uint8(sure_fg))
+            
+            _, markers = cv2.connectedComponents(np.uint8(sure_fg))
+            markers += 1
+            markers[unknown == 255] = 0
+            
+            mask_3c = cv2.cvtColor(clean_mask, cv2.COLOR_GRAY2BGR)
+            markers = cv2.watershed(mask_3c, markers)
+            
+            # C) Extract the winning colony (largest label > 1)
+            unique_labels = np.unique(markers)
+            max_area = 0
+            best_label = -1
+            for label_id in unique_labels:
+                if label_id > 1:
+                    area = np.sum(markers == label_id)
+                    if area > max_area:
+                        max_area, best_label = area, label_id
+            
+            if best_label != -1:
+                final_mask[markers == best_label] = 255
+            else:
+                final_mask = clean_mask
+                
+    return img_rgb, final_mask, (cX, cY)
