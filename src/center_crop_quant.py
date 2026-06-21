@@ -116,7 +116,7 @@ def run_unified_metadata_and_quantification(
             cell_line = determine_cell_line(folder_name, subfolder_name, filename_bf)
             live_time = determine_live_or_time(filename_bf, subfolder_name)
             
-            colony_mask = process_smooth_colony_outline_fastsam(img_raw_bf)
+            colony_mask = process_smooth_colony_outline_clahe(img_raw_bf)
             
             labels_colony = label(colony_mask)
             props = regionprops(labels_colony)
@@ -165,7 +165,7 @@ def run_unified_metadata_and_quantification(
                 
                 cv2.imwrite(os.path.join(fldr_stacks_bf, filename_ch2_base + "-crop.tif"), cropped_ch2_raw_blank)
                 
-                _, offset_masks = process_caspase_focused_offsets(cropped_ch2_raw_blank, offset=10)
+                _, offset_masks = process_caspase_focused_offsets(cropped_ch2_raw_blank, offset=0)
                 
                 # Safety formatting for mask to prevent cv2.imwrite from crashing
                 if offset_masks.dtype == bool:
@@ -184,9 +184,11 @@ def run_unified_metadata_and_quantification(
                 
                 if len(raw_radial_distribution) > 0:
                     all_raw_distance_distributions.append({
-                        "Image_ID": filename_base, "Condition_Group": treatment, "Raw_Micron_Distances": raw_radial_distribution
+                        "Image_ID": filename_base, 
+                        "Condition_Group": treatment, 
+                        "Raw_Micron_Distances": raw_radial_distribution
                     })
-                    
+
             if os.path.exists(sibling_ch4_path):
                 img_ch4_raw_full = cv2.imread(sibling_ch4_path, cv2.IMREAD_GRAYSCALE)
                 cropped_ch4_raw_blank = img_ch4_raw_full[roi_y:roi_y+crop_h, roi_x:roi_x+crop_w]

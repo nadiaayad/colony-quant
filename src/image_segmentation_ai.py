@@ -81,7 +81,7 @@ def process_smooth_colony_outline_clahe(img):
     matching original structures without mask bloat or ghost artifacts.
     """
     # 1. Locally equalize image contrast to reveal dim colony edges uniformly
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(16, 16))
     enhanced_img = clahe.apply(img)
     
     # 2. Smooth internal textures while firmly locking down boundary edges
@@ -176,14 +176,18 @@ def process_smooth_colony_outline_fastsam_old(img_gray):
     h, w = img_gray.shape
     
     # 1. Normalize for the AI
-    p_low, p_high = np.percentile(img_gray, (0, 99))
-    img_norm = np.clip(img_gray, p_low, p_high)
-    img_8u = ((img_norm - p_low) / (p_high - p_low) * 255).astype(np.uint8)
+    p_low, p_high = np.percentile(img_gray, (0, 99.5))
+    #img_norm = np.clip(img_gray, p_low, p_high)
+    #img_8u = ((img_norm - p_low) / (p_high - p_low) * 255).astype(np.uint8)
+
+    if p_high <= p_low: img_8u = img_gray.astype(np.uint8)
+    else: img_8u = ((np.clip(img_gray, p_low, p_high) - p_low) / (p_high - p_low) * 255.0).astype(np.uint8)
+    
     img_rgb = cv2.cvtColor(img_8u, cv2.COLOR_GRAY2RGB)
 
     # 2. LOCATE THE TARGET
     blurred = cv2.GaussianBlur(img_8u, (99, 99), 0)
-    _, rough_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, rough_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE)
     
     M = cv2.moments(rough_bin)
     if M["m00"] != 0:
@@ -216,7 +220,7 @@ def process_smooth_colony_outline_fastsam_old(img_gray):
         # --- FIX 2: SEVER THIN APPENDAGES ---
         # A Morphological 'Opening' breaks thin connections (necks).
         # A kernel of (35, 35) means any connection thinner than 35 pixels will be snapped.
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (155, 155))
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
         opened_mask = cv2.morphologyEx(core_mask, cv2.MORPH_OPEN, kernel_open)
         
         # --- FIX 3: THROW AWAY THE SEVERED APPENDAGE ---
@@ -228,20 +232,22 @@ def process_smooth_colony_outline_fastsam_old(img_gray):
 
     return final_mask
 
-def get_colony_fastsam_polished(img_path):
-    img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+def process_smooth_colony_outline_fastsam(img_gray):
+    DEVICE = 'cpu'
+    print("Loading FastSAM Model...")
+    model = FastSAM('FastSAM-s.pt') 
     if img_gray is None: return None, None, None
     h, w = img_gray.shape
     
     # 1. PRE-PROCESSING
-    img_smooth = cv2.bilateralFilter(img_gray, d=4, sigmaColor=75, sigmaSpace=75)
+    img_smooth = cv2.bilateralFilter(img_gray, d=5, sigmaColor=25, sigmaSpace=25)
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(16,16))
     img_enhanced = clahe.apply(img_smooth)
     img_rgb = cv2.cvtColor(img_enhanced, cv2.COLOR_GRAY2RGB)
 
     # 2. LOCATE THE TARGET (Using original gray for stable Otsu)
     blurred = cv2.GaussianBlur(img_gray, (99, 99), 0)
-    _, rough_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, rough_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE)
     
     M = cv2.moments(rough_bin)
     cX, cY = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])) if M["m00"] != 0 else (w // 2, h // 2)
@@ -293,4 +299,4 @@ def get_colony_fastsam_polished(img_path):
             else:
                 final_mask = clean_mask
                 
-    return img_rgb, final_mask, (cX, cY)
+    return final_mask
