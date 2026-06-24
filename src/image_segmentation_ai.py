@@ -5,6 +5,7 @@ from skimage.segmentation import watershed
 from skimage.morphology import reconstruction
 import scipy.ndimage as ndi
 from ultralytics import FastSAM
+from cellpose import models
 
 def apply_threshold(img, method="otsu"):
     """Fallback standard threshold algorithm."""
@@ -25,19 +26,32 @@ def apply_fiji_auto_contrast(img, saturate_percent=1.0):
     if p_high <= p_low: return img.astype(np.uint8)
     return ((np.clip(img, p_low, p_high) - p_low) / (p_high - p_low) * 255.0).astype(np.uint8)
 
-def segment_nuclei(img_dapi, model):
-    """DAPI Segmentation using Cellpose."""
-    try:
-        masks, flows, styles = model.eval(img_dapi, diameter=None, flow_threshold=0.4, cellprob_threshold=0.0)
-        total_nuclei = int(np.max(masks))
-        nuclear_pixels = float(np.sum(masks > 0))
-        return total_nuclei, nuclear_pixels, masks
-    except Exception as e:
-        print(f"  [Cellpose Fallback] Processing via watershed morphology: {e}")
-        thresh = apply_threshold(cv2.GaussianBlur(img_dapi, (5, 5), 2), method="otsu")
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh)
-        return int(num_labels - 1), float(np.sum(thresh > 0)), labels
+def segment_nuclei(img, model_type='nuclei', diameter=None):
+    """
+    Segments an image using Cellpose.
+    Handles string names ('cpsam'), file paths, OR pre-loaded CellposeModel objects.
+    """
+    # 1. Check if model_type is already a pre-loaded Cellpose model object
+    if hasattr(model_type, 'eval'):
+        model = model_type
+        
+    # 2. Check if it is a built-in Cellpose model string
+    elif isinstance(model_type, str) and model_type in ['nuclei', 'cyto', 'cyto2', 'cyto3', 'cpsam']:
+        model = models.CellposeModel(gpu=True, model_type=model_type)
+        
+    # 3. Otherwise, treat it as a file path to a custom fine-tuned model
+    else:
+        model = models.CellposeModel(gpu=True, pretrained_model=model_type)
 
+    # Execute the segmentation
+    masks, flows, styles = model.eval(img, diameter=diameter, channels=[0, 0])
+
+    # Extract base metrics
+    total_nuclei = len(np.unique(masks)) - 1 if np.max(masks) > 0 else 0
+    dapi_area_raw = float(np.sum(masks > 0))
+
+    return total_nuclei, dapi_area_raw, masks
+    
 def process_caspase_focused_offsets(img, offset=10):
     """
     Robust Caspase Segmentation Engine.
@@ -73,7 +87,7 @@ def process_caspase_focused_offsets(img, offset=10):
     # Generate the final mask safely
     masks = (img_blurred > t_offset).astype(np.uint8) * 255
     
-    return img_scaled, masks
+    return masks, None
     
 def process_smooth_colony_outline_clahe(img):
     """

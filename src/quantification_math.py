@@ -1,11 +1,15 @@
-import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
 import numpy as np
-from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from scipy.stats import ks_2samp, chisquare
 from skimage.measure import label, regionprops
+
+# =========================================================
+# GEOMETRY & DISTANCE MATHEMATICS
+# =========================================================
 
 def calculate_crop_coordinates(cx, cy, img_w, img_h, filename):
     """Establishes ROI boundaries around the detected colony."""
@@ -22,14 +26,35 @@ def calculate_crop_coordinates(cx, cy, img_w, img_h, filename):
     if roi_y < 0: roi_y = 0
     if (roi_x + crop_w) > img_w: roi_x = img_w - crop_w
     if (roi_y + crop_h) > img_h: roi_y = img_h - crop_h
+    
     return roi_x, roi_y, crop_w, crop_h
     
-def compute_radial_statistics(quant_mask, cx, cy, microns_per_pixel=0.645):
-    """Calculates physical distances from the colony centroid."""
+def calculate_crop_coordinates(cx, cy, img_w, img_h, filename):
+    """Establishes ROI boundaries around the detected colony."""
+    if "_T" in filename or "-T" in filename:
+        crop_w, crop_h = 1950, 1750 
+        roi_x = int(cx - (crop_w / 2))
+        roi_y = int((cy + 280) - (crop_h / 2))
+    else:
+        crop_w, crop_h = 1700, 1700
+        roi_x = int(cx - (crop_w / 2))
+        roi_y = int(cy - (crop_h / 2))
+        
+    if roi_x < 0: roi_x = 0
+    if roi_y < 0: roi_y = 0
+    if (roi_x + crop_w) > img_w: roi_x = img_w - crop_w
+    if (roi_y + crop_h) > img_h: roi_y = img_h - crop_h
+    
+    return roi_x, roi_y, crop_w, crop_h
+    
+def compute_pixel_radial_distances(quant_mask, colony_cx, colony_cy, microns_per_pixel=0.645):
+    """Calculates physical distances from the centroid and returns summary stats + raw list."""
     y_indices, x_indices = np.where(quant_mask > 0)
+    
     if len(x_indices) == 0:
         return 0.0, 0.0, 0.0, []
-    distances_px = np.sqrt((x_indices - cx) ** 2 + (y_indices - cy) ** 2)
+        
+    distances_px = np.sqrt((x_indices - colony_cx) ** 2 + (y_indices - colony_cy) ** 2)
     distances_microns = distances_px * microns_per_pixel
     
     mean_rad = float(np.mean(distances_microns))
@@ -38,19 +63,88 @@ def compute_radial_statistics(quant_mask, cx, cy, microns_per_pixel=0.645):
     
     return mean_rad, median_rad, std_rad, distances_microns.tolist()
     
-def get_object_distances(mask, colony_cx, colony_cy, microns_per_pixel=0.645):
-    # Label distinct objects
+def compute_object_radial_distances(mask, colony_cx, colony_cy, microns_per_pixel=0.645):
+    """Labels distinct objects and calculates distance stats + raw list."""
     labeled_mask = label(mask > 0)
     props = regionprops(labeled_mask)
     
-    # Calculate distance for each object centroid
     distances = []
     for prop in props:
         obj_y, obj_x = prop.centroid
         dist_px = np.sqrt((obj_x - colony_cx)**2 + (obj_y - colony_cy)**2)
         distances.append(dist_px * microns_per_pixel)
         
-    return distances
+    if len(distances) == 0:
+        return 0.0, 0.0, 0.0, []
+
+    mean_rad = float(np.mean(distances))
+    median_rad = float(np.median(distances))
+    std_rad = float(np.std(distances))
+ 
+    return mean_rad, median_rad, std_rad, distances
+
+def test_radial_uniformity(data_distances, colony_radius=510):
+    """
+    Tests radial uniformity and calculates Cramer's V effect size.
+    """
+    # Create bins
+    bins = np.linspace(0, colony_radius, 10)
+    observed, _ = np.histogram(data_distances, bins=bins)
+    
+    # Calculate Expected
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    raw_expected = bin_centers
+    expected = (raw_expected / np.sum(raw_expected)) * np.sum(observed)
+    expected = np.maximum(expected, 1e-6)
+    
+    # 1. Chi-Square Test
+    chi2, p_val = chisquare(f_obs=observed, f_exp=expected)
+    
+    # 2. Cramer's V Calculation
+    # V = sqrt(chi2 / (N * (min(k, r) - 1)))
+    # Since this is a 1-row table (1x10), we compare observed vs expected (2 rows)
+    n = np.sum(observed)
+    min_dim = min(2, 10) - 1
+    cramers_v = np.sqrt(chi2 / (n * min_dim))
+    
+    return chi2, p_val, cramers_v
+    
+def plot_spatial_cdf(data_distances, colony_radius=510, title="Spatial Distribution CDF"):
+    """
+    Plots the empirical CDF of observed distances against the theoretical 
+    CDF for a uniform distribution in a circle: F(r) = (r/R)^2.
+    """
+    # 1. Prepare Observed Data (Empirical CDF)
+    sorted_data = np.sort(np.array(data_distances))
+    # Filter data to be within radius for the plot
+    sorted_data = sorted_data[sorted_data <= colony_radius]
+    n_filtered = len(sorted_data)
+    ecdf_y = np.arange(1, n_filtered + 1) / n_filtered
+    
+    # 2. Prepare Theoretical Uniform CDF
+    r_theoretical = np.linspace(0, colony_radius, 100)
+    cdf_theoretical = (r_theoretical / colony_radius) ** 2
+    
+    # 3. Plotting
+    plt.figure(figsize=(8, 6))
+    plt.plot(r_theoretical, cdf_theoretical, 'k--', label='Theoretical Uniform', linewidth=2)
+    plt.step(sorted_data, ecdf_y, where='post', label='Observed Data', linewidth=2)
+    
+    plt.xlabel('Distance from Centroid ($\mu m$)')
+    plt.ylabel('Cumulative Fraction')
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, linestyle=':', alpha=0.6)
+    
+    # Interpretation hints
+    plt.text(0.05, 0.9, 'Curve above theory = Central Clustering', transform=plt.gca().transAxes)
+    plt.text(0.05, 0.85, 'Curve below theory = Peripheral Clustering', transform=plt.gca().transAxes)
+    
+    plt.tight_layout()
+    plt.show()
+# =========================================================
+# STATISTICAL VISUALIZATION ENGINES
+# =========================================================
 
 def run_statistical_analysis(df, x_variable, y_variable, subset_categories=None, custom_palette=None, title=None, save_filename="plot_output"):
     """
@@ -188,28 +282,6 @@ def run_statistical_analysis(df, x_variable, y_variable, subset_categories=None,
     
     plt.show()
 
-def test_radial_uniformity(data_distances, colony_radius=510):
-    """
-    Tests if distances are uniformly distributed within a circular colony.
-    Returns: chi2_statistic, p_value
-    """
-    # Create radial bins
-    bins = np.linspace(0, colony_radius, 10)
-    observed_counts, _ = np.histogram(data_distances, bins=bins)
-    
-    # Expected: Density is proportional to r in a circular area
-    bin_centers = (bins[:-1] + bins[1:]) / 2
-    expected_counts = (bin_centers / np.sum(bin_centers)) * len(data_distances)
-    
-    chi2, p_val = chisquare(f_obs=observed_counts, f_exp=expected_counts)
-    return chi2, p_val
-
-import pandas as pd
-import numpy as np
-import seaborn as sns
-import matplotlib.pyplot as plt
-import scipy.stats as stats
-
 def plot_spatial_ridgeline(df, condition_col, distance_col, control_group, subset_categories=None, custom_palette=None, title=None, save_filename="ridgeline_output"):
     """
     Generates a publication-ready Ridgeline plot for spatial distributions, 
@@ -335,6 +407,142 @@ def plot_spatial_ridgeline(df, condition_col, distance_col, control_group, subse
 
     # 7. Vector Export for Illustrator
     #plt.savefig(f"{save_filename}.svg", format='svg', transparent=True, bbox_inches='tight')
-    #plt.savefig(f"{save_filename}.png", format='png', dpi=300, transparent=True, bbox_inches='tight')
+    #plt.savefig(f"{save_filename}.png", format='png', dpi=300
+
+def bootstrap_ks_test_with_stats(dist_control, dist_treatment, n_samples=300, iterations=500):
+    """
+    Returns median p-value, median signed K-S statistic, 
+    and median absolute K-S statistic.
+    The K-S statistic (D) is reported as signed (D signed=Dabsxsign(Med treatment−Med control)). 
+    Positive values indicate an outward spatial shift toward the colony periphery, 
+    while negative values indicate an inward spatial shift toward the colony center
+    """
+    p_values = []
+    ks_stats_signed = []
+    ks_stats_abs = []
+    
+    n_c = min(n_samples, len(dist_control))
+    n_t = min(n_samples, len(dist_treatment))
+    
+    for _ in range(iterations):
+        c_sub = np.random.choice(dist_control, n_c, replace=False)
+        t_sub = np.random.choice(dist_treatment, n_t, replace=False)
+        
+        # Calculate signed difference
+        # We need to sort and interpolate to find the max difference
+        # Scipy's ks_2samp does this internally
+        stat, p = ks_2samp(c_sub, t_sub)
+        
+        # New Convention: (Treatment - Control)
+        # If Treatment > Control, result is positive (shift to periphery)
+        # If Treatment < Control, result is negative (shift to center)
+        diff = np.median(t_sub) - np.median(c_sub)
+        direction = 1 if diff > 0 else -1
+        
+        p_values.append(p)
+        ks_stats_signed.append(stat * direction) # Directional
+        ks_stats_abs.append(stat)                # Absolute magnitude
+    
+    return np.median(p_values), np.median(ks_stats_signed), np.median(ks_stats_abs)
+
+
+def plot_spatial_ridgeline_bs(df, condition_col, distance_col, control_group, 
+                           subset_categories=None, custom_palette=None, 
+                           title=None, bootstrap=True, n_samples=300, iterations=500):
+    """
+    Generates a publication-ready Ridgeline plot for spatial distributions.
+    Uses bootstrapping to ensure p-values are robust to large sample sizes.
+    """
+    # 1. Prepare Data
+    analysis_df = df.dropna(subset=[condition_col, distance_col]).copy()
+    
+    # 2. Subset and Order
+    if subset_categories is not None:
+        analysis_df = analysis_df[analysis_df[condition_col].isin(subset_categories)]
+        categories = subset_categories
+    else:
+        unique_cats = list(analysis_df[condition_col].unique())
+        if control_group in unique_cats:
+            unique_cats.remove(control_group)
+            categories = [control_group] + unique_cats
+        else:
+            categories = unique_cats
+    
+    analysis_df[condition_col] = pd.Categorical(analysis_df[condition_col], categories=categories, ordered=True)
+    
+    # 3. Statistical Testing
+    stats_results = {}
+    control_data = analysis_df[analysis_df[condition_col] == control_group][distance_col]
+    
+    print(f"--- ROBUST BOOTSTRAP STATS (Reference: {control_group}) ---")
+    for cat in categories:
+        if cat == control_group:
+            stats_results[cat] = "Reference"
+        else:
+            test_data = analysis_df[analysis_df[condition_col] == cat][distance_col]
+            
+            if bootstrap:
+                # Helper function modified to return both p-value AND k-s stat
+                p_val, ks_stat, ks_stat_abs = bootstrap_ks_test_with_stats(control_data, test_data, n_samples=n_samples, iterations=iterations)
+                label_text = f"p{n_samples} = "
+            else:
+                ks_stat, p_val = ks_2samp(control_data, test_data)
+                label_text = "p = "
+                
+            print(f"{cat} vs {control_group}: K-S stat = {ks_stat:.4f} | {label_text}{p_val:.6e}")
+            
+            # Formatted for the plot label
+            p_str = f"{p_val:.3f}" if p_val >= 0.001 else "< 0.001"
+            stats_results[cat] = f"K-S={ks_stat:.2f}\n{label_text}{p_str}"
+
+    # 4. Ridgeline Plot
+    sns.set_theme(style="white", rc={"axes.facecolor": (0, 0, 0, 0)})
+    g = sns.FacetGrid(analysis_df, row=condition_col, hue=condition_col, 
+                      aspect=6, height=1.2, palette=custom_palette or "husl")
+
+    g.map(sns.kdeplot, distance_col, bw_adjust=0.5, clip_on=False, fill=True, alpha=0.8, linewidth=1.5)
+    g.map(plt.axhline, y=0, linewidth=1.5, linestyle="-", color="black", clip_on=False)
+
+    # 5. Labeling Function 
+    def label_and_stats(x, color, label):
+        ax = plt.gca()
+        cat_name = str(label)
+        
+        # Position: Left-aligned, slightly below the label
+        # Condition Name at y=0.35, Stats at y=0.15
+        
+        # Draw condition name
+        ax.text(0.01, 0.35, cat_name, fontweight="bold", color=color, 
+                ha="left", va="center", transform=ax.transAxes, fontsize=14)
+        
+        # Draw stats below the name, smaller font
+        p_text = stats_results.get(cat_name, "")
+        #text_color = "black" if p_text == "Reference" else color
+        text_color = color
+        ax.text(0.01, 0.15, p_text, fontweight="bold", color=text_color,
+                ha="left", va="center", transform=ax.transAxes, fontsize=10)
+
+    g.map(label_and_stats, distance_col)
+    
+    # 6. Formatting
+    g.figure.subplots_adjust(hspace=-0.4)
+    g.set_titles("")
+    g.set(yticks=[], ylabel="")
+    g.despine(bottom=True, left=True)
+    g.set_xlabels(distance_col.replace("_", " "), fontweight="bold", fontsize=14)
+    
+    # Fix the bottom axis line
+    bottom_ax = g.axes.flat[-1]
+    bottom_ax.spines['bottom'].set_visible(True)
+    bottom_ax.spines['bottom'].set_linewidth(1.5)
+    bottom_ax.spines['bottom'].set_color('black')
+    bottom_ax.tick_params(axis='x', bottom=True, length=6, width=1.5, labelsize=12, color='black')
+    
+    for ax in g.axes.flat[:-1]:
+        ax.tick_params(axis='x', bottom=False, labelbottom=False)
     
     plt.show()
+
+    # 7. Vector Export for Illustrator
+    #plt.savefig(f"{save_filename}.svg", format='svg', transparent=True, bbox_inches='tight')
+    #plt.savefig(f"{save_filename}.png", format='png', dpi=300
