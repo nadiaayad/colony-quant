@@ -314,3 +314,42 @@ def process_smooth_colony_outline_fastsam(img_gray):
                 final_mask = clean_mask
                 
     return final_mask
+
+def load_precomputed_mask(img_path, **kwargs):
+    """
+    Loads a pre-cropped mask, extracts morphological parameters, 
+    and returns dummy crop coordinates so downstream processing doesn't fail.
+    """
+    # 1. Read the pre-calculated mask
+    mask_raw = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if mask_raw is None:
+        raise ValueError(f"Could not load mask at {img_path}")
+        
+    # Ensure the mask is strictly binary
+    _, binary_mask = cv2.threshold(mask_raw, 127, 255, cv2.THRESH_BINARY)
+    img_h, img_w = binary_mask.shape
+
+    # 2. Extract morphological features
+    labels_colony = label(binary_mask)
+    props = regionprops(labels_colony)
+
+    if len(props) > 0:
+        colony_prop = max(props, key=lambda r: r.area)
+        cy, cx = colony_prop.centroid
+        colony_area = float(np.sum(binary_mask == 255))
+        perimeter = colony_prop.perimeter
+        solidity = colony_prop.solidity
+        aspect_ratio = colony_prop.major_axis_length / colony_prop.minor_axis_length if colony_prop.minor_axis_length > 0 else 1.0
+        roundness = (4.0 * colony_area) / (math.pi * (colony_prop.major_axis_length ** 2)) if colony_prop.major_axis_length > 0 else 1.0
+    else:
+        # Failsafe for an empty mask
+        cx, cy, colony_area, perimeter, solidity, aspect_ratio, roundness = img_w/2, img_h/2, 0.0, 0.0, 1.0, 1.0, 1.0
+
+    # 3. "Fake" the crop coordinates
+    # Since the image is already cropped, the bounding box is simply the full image size
+    roi_x, roi_y = 0, 0
+    crop_w, crop_h = img_w, img_h
+
+    # We return the binary mask twice to satisfy the (cropped_bf, cropped_mask) tuple 
+    # expected by the master script if you ever need to reference it.
+    return cx, cy, colony_area, perimeter, solidity, aspect_ratio, roundness, roi_x, roi_y, crop_w, crop_h, binary_mask, binary_mask

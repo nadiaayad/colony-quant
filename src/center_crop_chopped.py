@@ -4,6 +4,7 @@ import json
 import numpy as np
 import math
 import pandas as pd
+import glob
 from skimage.measure import label, regionprops
 from src.quantification_math import compute_pixel_radial_distances, compute_object_radial_distances
 from tqdm.auto import tqdm  # <--- Progress Bar Library
@@ -47,7 +48,55 @@ def generate_colony_masks_and_crops(img_raw_bf, filename_bf, **kwargs):
     }
 
     return cropped_bf, cropped_mask, colony_stats
+def load_precomputed_mask(img_array, filename, **kwargs):
+    """
+    Loads a pre-cropped mask with robust auto-fixes for Fiji/ImageJ artifacts.
+    """
+    if len(img_array.shape) == 3:
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        
+    # --- FIX 1: Fiji 1-value Bug ---
+    # If the mask was saved with 1s instead of 255s, scale it up safely
+    if np.max(img_array) == 1:
+        img_array = (img_array * 255).astype(np.uint8)
+    else:
+        img_array = img_array.astype(np.uint8)
 
+    # --- FIX 2: Inverted Mask Bug (Bottom-Left Corner Check) ---
+    # img_h is the height, so img_h - 1 is the bottom row index.
+    # We check if that corner is bright (white background).
+    img_h, img_w = img_array.shape
+    if img_array[img_h - 1, 0] > 127:
+        img_array = cv2.bitwise_not(img_array)
+        
+    _, binary_mask = cv2.threshold(img_array, 127, 255, cv2.THRESH_BINARY)
+    img_h, img_w = binary_mask.shape
+
+    # Extract morphological features
+    labels_colony = label(binary_mask)
+    props = regionprops(labels_colony)
+
+    if len(props) > 0:
+        colony_prop = max(props, key=lambda r: r.area)
+        cy, cx = colony_prop.centroid
+        colony_area = float(np.sum(binary_mask == 255))
+        perimeter = colony_prop.perimeter
+        solidity = colony_prop.solidity
+        aspect_ratio = colony_prop.major_axis_length / colony_prop.minor_axis_length if colony_prop.minor_axis_length > 0 else 1.0
+        roundness = (4.0 * colony_area) / (math.pi * (colony_prop.major_axis_length ** 2)) if colony_prop.major_axis_length > 0 else 1.0
+    else:
+        cx, cy, colony_area, perimeter, solidity, aspect_ratio, roundness = img_w/2, img_h/2, 0.0, 0.0, 1.0, 1.0, 1.0
+
+    # Pack the stats into the expected dictionary
+    c_stats = {
+        'cx': cx, 'cy': cy, 'colony_area': colony_area, 
+        'perimeter': perimeter, 'solidity': solidity, 
+        'aspect_ratio': aspect_ratio, 'roundness': roundness,
+        'roi_x': 0, 'roi_y': 0, 'crop_w': img_w, 'crop_h': img_h
+    }
+
+    return binary_mask, binary_mask, c_stats
+    
 def threshold_caspase(img_raw_crop, **kwargs):
     """Thresholds the Cleaved Caspase 3 channel."""
     bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 50))
@@ -125,6 +174,7 @@ def quantify_channel(img_raw_crop, colony_mask_crop, threshold_func, col_stats, 
 # =========================================================
 
 def run_unified_metadata_and_quantification(
+    main_folder,           
     cellpose_model,
     outline_setup, 
     quant_channels_list, 
@@ -133,15 +183,16 @@ def run_unified_metadata_and_quantification(
     """
     Executes the main segmentation and quantification pipeline using dynamic dictionaries.
     Handles progress tracking, comprehensive metadata extraction, and multi-channel metrics.
+    Integrates direct-to-disk CSV streaming and runs headlessly for HPC compatibility.
     """
-    main_folder = prompt_for_main_folder()
-    if not main_folder:
-        print("No folder selected. Pipeline terminated.")
+    
+    # --- Headless Directory Validation ---
+    if not main_folder or not os.path.exists(main_folder):
+        print(f"Error: The target directory '{main_folder}' does not exist or is invalid. Pipeline terminated.")
         return
         
     print(f"Starting Unified Analysis Workflow Engine under: {main_folder}")
     all_records = []
-    all_raw_distance_distributions = []
     cached_folder_channels = {}
 
     valid_extensions = ('.nd2', '.lif', '.czi', '.tif', '.tiff', '.png', '.jpg', '.jpeg')
@@ -159,8 +210,18 @@ def run_unified_metadata_and_quantification(
         print(f"Error: Could not discover any baseline directories named '{outline_folder_name}'.")
         return
 
+    # --- SETUP INCREMENTAL CSV FOR RAW DISTANCES ---
+    distribution_path = os.path.join(main_folder, "colony_radial_distances_raw_distribution.csv")
+    pd.DataFrame(columns=[
+        "Image_ID", "Treatment", "Shape", "Channel", "Type", "Distance_Microns"
+    ]).to_csv(distribution_path, index=False)
+    print(f"Initialized raw distribution stream at: {distribution_path}")
+
     # --- PROGRESS BAR SETUP ---
-    total_files = sum([len([x for x in os.listdir(folder) if not x.startswith('.') and '_Corr' in x]) for folder in target_ref_folders])
+    
+    target_token = outline_setup.get('token', '_Corr')
+    
+    total_files = sum([len([x for x in os.listdir(folder) if not x.startswith('.') and target_token in x]) for folder in target_ref_folders])
     print(f"Found {len(target_ref_folders)} datasets containing {total_files} total images to process.")
     
     pbar = tqdm(total=total_files, desc="Pipeline Progress", unit="img")
@@ -192,11 +253,14 @@ def run_unified_metadata_and_quantification(
         channel_ui_info = cached_folder_channels[folder_identifier]
 
         path_bf_files = sorted([os.path.join(ref_folder_path, x) for x in os.listdir(ref_folder_path) 
-                                if not x.startswith('.') and os.path.isfile(os.path.join(ref_folder_path, x)) and '_Corr' in x])
+                                if not x.startswith('.') and os.path.isfile(os.path.join(ref_folder_path, x)) and target_token in x])
         
         for file_path in path_bf_files:
             filename_bf = os.path.basename(file_path)
             filename_base = os.path.splitext(filename_bf)[0]
+            
+            # Extract Core ID by stripping the mask token to help Glob search safely
+            core_id = filename_base.replace(outline_token, "").replace("_Ch0", "").replace("_BkgCorr", "").replace("_Ch1", "").replace("_Ch2", "").replace("_Ch3","")
             
             img_raw_bf = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
             if img_raw_bf is None: 
@@ -217,14 +281,23 @@ def run_unified_metadata_and_quantification(
             }
             record.update(channel_ui_info)
             
+            # Temporary list to hold exploded rows just for THIS image
+            image_exploded_rows = []
+
             # --- 1. OUTLINE GEOMETRY ---
             outline_func = outline_setup['method']
             outline_kwargs = outline_setup.get('kwargs', {})
             
             cropped_bf, cropped_mask, c_stats = outline_func(img_raw_bf, filename_bf, **outline_kwargs)
             
-            cv2.imwrite(os.path.join(fldr_stacks_bf, filename_base + "-crop.tif"), cropped_bf)
-            cv2.imwrite(os.path.join(fldr_masks, filename_base + "_mask.tif"), cropped_mask)
+            is_precomputed = (outline_func.__name__ == 'load_precomputed_mask')
+
+            # Only saving the images if not using pre-computed masks
+            if not is_precomputed:
+                cv2.imwrite(os.path.join(fldr_stacks_bf, filename_base + "-crop.tif"), cropped_bf)
+                cv2.imwrite(os.path.join(fldr_masks, filename_base + "_mask.tif"), cropped_mask)
+            else:
+                print(f"   -> Skipping save: Using pre-computed mask for {filename_base}")
             
             # Save Base Metrics
             record['Colony_Area_px'] = c_stats['colony_area']
@@ -243,17 +316,33 @@ def run_unified_metadata_and_quantification(
                 q_func = q_chan['method']
                 q_kwargs = q_chan.get('kwargs', {})
                 
-                sibling_q_path = file_path.replace(outline_folder_name, q_chan['folder']).replace(outline_token, q_chan['token'])
+                # --- NEW GLOB SEARCH LOGIC ---
+                target_dir = os.path.join(parent_batch_dir, q_chan['folder'])
+                search_pattern = os.path.join(target_dir, f"*{core_id}*{q_chan['token']}*")
+                possible_files = glob.glob(search_pattern)
                 
-                if os.path.exists(sibling_q_path):
-                    img_q_raw = cv2.imread(sibling_q_path, cv2.IMREAD_GRAYSCALE)
+                print(f"\n[Path Debug] Linking {q_chan['label']}...")
+                print(f"  -> Origin Mask: {file_path}") 
+                print(f"  -> Built Target Pattern: {search_pattern}")
+                print(f"  -> File Exists?: {len(possible_files) > 0}")
+                print(f"  -> File is: {possible_files[0]}")
+
+                if possible_files:
+                    sibling_q_path = possible_files[0]
+                    # Loaded with UNCHANGED to fix the 16-bit to black issue
+                    img_q_raw = cv2.imread(sibling_q_path, cv2.IMREAD_UNCHANGED)
+                    
                     cropped_q_raw = img_q_raw[
                         int(c_stats['roi_y']):int(c_stats['roi_y']+c_stats['crop_h']), 
                         int(c_stats['roi_x']):int(c_stats['roi_x']+c_stats['crop_w'])
                     ]
                     
                     filename_q_base = filename_base.replace(outline_token, q_chan['token'])
-                    cv2.imwrite(os.path.join(fldr_stacks_bf, filename_q_base + "-crop.tif"), cropped_q_raw)
+                    if not is_precomputed:
+                        cv2.imwrite(os.path.join(fldr_stacks_bf, filename_q_base + "-crop.tif"), cropped_q_raw)
+                    else:
+                        print(f"   -> Skipping save: Using pre-computed mask for {filename_q_base}")
+                    
                     
                     # Core Modular Quantification
                     q_results = quantify_channel(cropped_q_raw, cropped_mask, q_func, c_stats, **q_kwargs)
@@ -279,33 +368,37 @@ def run_unified_metadata_and_quantification(
                         dashboard_ch2_raw = cropped_q_raw
                         dashboard_ch2_mask = q_results['masked_img']
 
-                    if q_results['raw_px'] or q_results['raw_obj']:
-                        all_raw_distance_distributions.append({
-                            "Image_ID": filename_base, 
-                            "Treatment": treatment,      # Updated here
-                            "Shape": shape,              # Updated here
-                            "Channel": label,
-                            "Raw_Px_Distances": q_results['raw_px'], 
-                            "Raw_Obj_Distances": q_results['raw_obj']
-                        })
+                    # Incrementally collect raw distances for this channel
+                    for dist in q_results.get('raw_px', []):
+                        image_exploded_rows.append({"Image_ID": filename_base, "Treatment": treatment, "Shape": shape, "Channel": label, "Type": "Pixel", "Distance_Microns": dist})
+                    for dist in q_results.get('raw_obj', []):
+                        image_exploded_rows.append({"Image_ID": filename_base, "Treatment": treatment, "Shape": shape, "Channel": label, "Type": "Object", "Distance_Microns": dist})
             
             # --- 3. NUCLEAR CHANNEL ---
             nuc_label = nuc_setup['label']
             nuc_func = nuc_setup['method']
             nuc_kwargs = nuc_setup.get('kwargs', {})
             
-            sibling_nuc_path = file_path.replace(outline_folder_name, nuc_setup['folder']).replace(outline_token, nuc_setup['token'])
+            # --- NEW GLOB SEARCH LOGIC ---
+            target_nuc_dir = os.path.join(parent_batch_dir, nuc_setup['folder'])
+            nuc_pattern = os.path.join(target_nuc_dir, f"*{core_id}*{nuc_setup['token']}*")
+            possible_nuc = glob.glob(nuc_pattern)
             
-            if os.path.exists(sibling_nuc_path):
-                img_nuc_raw = cv2.imread(sibling_nuc_path, cv2.IMREAD_GRAYSCALE)
+            if possible_nuc:
+                sibling_nuc_path = possible_nuc[0]
+                # Loaded with UNCHANGED to fix the 16-bit to black issue
+                img_nuc_raw = cv2.imread(sibling_nuc_path, cv2.IMREAD_UNCHANGED)
                 cropped_nuc_raw = img_nuc_raw[
                     int(c_stats['roi_y']):int(c_stats['roi_y']+c_stats['crop_h']), 
                     int(c_stats['roi_x']):int(c_stats['roi_x']+c_stats['crop_w'])
                 ]
                 
                 filename_nuc_base = filename_base.replace(outline_token, nuc_setup['token'])
-                cv2.imwrite(os.path.join(fldr_stacks_bf, filename_nuc_base + "-crop.tif"), cropped_nuc_raw)
-                
+                if not is_precomputed:
+                    cv2.imwrite(os.path.join(fldr_stacks_bf, filename_nuc_base + "-crop.tif"), cropped_nuc_raw)
+                else:
+                    print(f"   -> Skipping save: Using pre-computed mask for {filename_nuc_base}")
+                                
                 # Pass the loaded Cellpose model to the function dynamically
                 if 'model_type' in nuc_kwargs and not isinstance(nuc_kwargs['model_type'], str):
                      nuc_kwargs['model_type'] = cellpose_model
@@ -336,17 +429,17 @@ def run_unified_metadata_and_quantification(
                 dashboard_ch4_raw = cropped_nuc_raw
                 dashboard_ch4_mask = nuc_results['masked_img']
 
-                if nuc_results['raw_px'] or nuc_results['raw_obj']:
-                    all_raw_distance_distributions.append({
-                        "Image_ID": filename_base, 
-                        "Treatment": treatment,      # Updated here
-                        "Shape": shape,              # Updated here
-                        "Channel": nuc_label,
-                        "Raw_Px_Distances": nuc_results['raw_px'], 
-                        "Raw_Obj_Distances": nuc_results['raw_obj']
-                    })
+                # Incrementally collect raw distances for Nuclear channel
+                for dist in nuc_results.get('raw_px', []):
+                    image_exploded_rows.append({"Image_ID": filename_base, "Treatment": treatment, "Shape": shape, "Channel": nuc_label, "Type": "Pixel", "Distance_Microns": dist})
+                for dist in nuc_results.get('raw_obj', []):
+                    image_exploded_rows.append({"Image_ID": filename_base, "Treatment": treatment, "Shape": shape, "Channel": nuc_label, "Type": "Object", "Distance_Microns": dist})
 
             all_records.append(record)
+            
+            # --- FLUSH IMAGE RAW DATA TO DISK IMMEDIATELY ---
+            if image_exploded_rows:
+                pd.DataFrame(image_exploded_rows).to_csv(distribution_path, mode='a', header=False, index=False)
 
             # --- VISUALIZATION DASHBOARD ---
             try:
@@ -367,39 +460,13 @@ def run_unified_metadata_and_quantification(
         print("Scanned directory block completed with no valid records logged.")
         return
 
-    # Export Master DataFrame
+    # Export Master DataFrame (The summarized excel sheet)
     master_summary_df = pd.DataFrame(all_records)
     summary_xlsx_path = os.path.join(main_folder, "combined_metadata_quantification_summary.xlsx")
     master_summary_df.to_excel(summary_xlsx_path, index=False)
-    print(f"\n✓ Master Metadata & Quantification Summary Saved: {summary_xlsx_path}")
     
-    # Flatten and Export the Long-form CSV
-    exploded_rows = []
-    for item in all_raw_distance_distributions:
-        for dist in item["Raw_Px_Distances"]:
-            exploded_rows.append({
-                "Image_ID": item["Image_ID"], 
-                "Treatment": item["Treatment"], # Updated here
-                "Shape": item["Shape"],         # Updated here
-                "Channel": item["Channel"], 
-                "Type": "Pixel", 
-                "Distance_Microns": dist
-            })
-        for dist in item["Raw_Obj_Distances"]:
-            exploded_rows.append({
-                "Image_ID": item["Image_ID"], 
-                "Treatment": item["Treatment"], # Updated here
-                "Shape": item["Shape"],         # Updated here
-                "Channel": item["Channel"], 
-                "Type": "Object", 
-                "Distance_Microns": dist
-            })
-            
-    if exploded_rows:
-        raw_distribution_df = pd.DataFrame(exploded_rows)
-        distribution_path = os.path.join(main_folder, "colony_radial_distances_raw_distribution.csv")
-        raw_distribution_df.to_csv(distribution_path, index=False)
-        print(f"✓ Raw Cellular Intensity Coordinate Distribution Exported: {distribution_path}")
+    print(f"\n✓ Master Metadata & Quantification Summary Saved: {summary_xlsx_path}")
+    print(f"✓ Raw Cellular Spatial Distribution CSV completely streamed and saved: {distribution_path}")
         
     print("\n" + "="*60 + "\nUNIFIED ANALYSIS MATRIX PIPELINE SECURED & COMPLETE\n" + "="*60)
     return master_summary_df

@@ -1,20 +1,10 @@
 import os
-import tkinter as tk
-from tkinter import filedialog
 import matplotlib.pyplot as plt
 from aicsimageio import AICSImage
 
 def mkdir_p(path):
     """Safely handles directory creation."""
     os.makedirs(path, exist_ok=True)
-
-def prompt_for_main_folder():
-    """Opens a graphical window to select the top-level directory."""
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)
-    selected_folder = filedialog.askdirectory(title="Select main Experimental Folder")
-    return selected_folder
 
 def determine_shape(filename):
     filename_upper = filename.upper()
@@ -46,13 +36,14 @@ def determine_position(filename):
 def determine_treatment(filename):
     keys = ["ctrl", "rocki", "smifh2", "blebb", "cytd", "jasplak", "zvad", "qvd",
             "unc", "maggel", "stretched", "pacman", "cd47-20ugml", "cd47_20ugml",
-            "shluc", "shdock1","shmertk", "shcd24", "shcd47"]
+            "shluc", "shdock1","shmertk", "shcd24", "shcd47", "ps", "pc", "fs"]
     mapping = {
         "ctrl": "Ctrl", "rocki": "ROCKi", "smifh2": "SMIFH2", "blebb": "Blebb", 
         "cytd": "Cytd", "jasplak": "Jasplak", "zvad": "ZVAD", "qvd": "QVD", 
         "unc": "UNC2541", "maggel": "MagGel", "stretched": "Stretched", "pm":"PacMan",
         "cd47-20ugml":"CD47 20 ugml", "cd47_20ugml":"CD47 20 ugml",
-        "shluc":"shLuc", "shdock1":"shDOCK1","shmertk":"shMERTK", "shcd24":"shCD24", "shcd47":"shCD47"
+        "shluc":"shLuc", "shdock1":"shDOCK1","shmertk":"shMERTK", "shcd24":"shCD24", "shcd47":"shCD47",
+        "ps":"PSbeads", "pc":"PCbeads", "fs":"FSbeads"
     }
     filename_lower = filename.lower()
     if "maggel" in filename_lower:

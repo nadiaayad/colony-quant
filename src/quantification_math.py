@@ -6,6 +6,8 @@ import scipy.stats as stats
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from scipy.stats import ks_2samp, chisquare
 from skimage.measure import label, regionprops
+from scipy.spatial.distance import pdist
+
 
 # =========================================================
 # GEOMETRY & DISTANCE MATHEMATICS
@@ -546,3 +548,110 @@ def plot_spatial_ridgeline_bs(df, condition_col, distance_col, control_group,
     # 7. Vector Export for Illustrator
     #plt.savefig(f"{save_filename}.svg", format='svg', transparent=True, bbox_inches='tight')
     #plt.savefig(f"{save_filename}.png", format='png', dpi=300
+
+def compute_radial_distribution_function(coords, colony_area, max_distance=100, num_bins=50):
+    """
+    Computes the spatial Radial Distribution Function g(r) for a set of points.
+    
+    Parameters:
+    - coords: List or array of (x, y) coordinates for each cell/object.
+    - colony_area: The total area of the colony mask (in square units).
+    - max_distance: The maximum object-to-object distance to analyze.
+    - num_bins: Number of distance bins.
+    
+    Returns:
+    - bin_centers: The distance values (r)
+    - g_r: The radial distribution function values at each r.
+    """
+    coords = np.array(coords)
+    N = len(coords)
+    
+    if N < 2:
+        return np.array([]), np.array([])
+
+    # 1. Calculate all pairwise distances between every cell
+    pairwise_distances = pdist(coords)
+    
+    # 2. Create distance bins
+    bins = np.linspace(0, max_distance, num_bins + 1)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    
+    # 3. Count how many pairs fall into each distance bin
+    counts, _ = np.histogram(pairwise_distances, bins=bins)
+    
+    # 4. Calculate expected pairs for a completely random (uniform) distribution
+    # Area of the annulus (ring) for each bin: pi * (r_outer^2 - r_inner^2)
+    annulus_areas = np.pi * (bins[1:]**2 - bins[:-1]**2)
+    
+    # Global density of cells in the colony
+    global_density = N / colony_area
+    
+    # Expected number of pairs = (Total Pairs) * (Annulus Area / Total Area)
+    # Total possible pairs is N*(N-1)/2
+    total_pairs = (N * (N - 1)) / 2
+    expected_pairs = total_pairs * (annulus_areas / colony_area)
+    
+    # 5. g(r) is the ratio of Observed vs Expected
+    # Add a tiny number to avoid division by zero
+    g_r = counts / (expected_pairs + 1e-10)
+    
+    return bin_centers, g_r
+
+def plot_local_clustering_rdf(df, group_col, coords_col, area_col='Colony_Area_um2', 
+                              max_dist=50, num_bins=30, title=None, custom_palette=None, save_filename=None):
+    """
+    Generates a publication-ready plot of the Radial Distribution Function g(r).
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    # Filter out rows missing coordinate data
+    analysis_df = df.dropna(subset=[coords_col, area_col]).copy()
+    groups = analysis_df[group_col].unique()
+    
+    sns.set_theme(style="ticks", context="talk")
+    palette_to_use = custom_palette if custom_palette else "Set1"
+    
+    plt.figure(figsize=(9, 6))
+    
+    # For mapping colors consistently
+    colors = sns.color_palette(palette_to_use, n_colors=len(groups))
+    
+    for idx, group in enumerate(groups):
+        group_data = analysis_df[analysis_df[group_col] == group]
+        all_g_r = []
+        
+        for _, row in group_data.iterrows():
+            coords = row[coords_col]
+            area = row[area_col]
+            
+            # Only process images that actually have enough cells to measure interactions
+            if isinstance(coords, list) and len(coords) >= 5:
+                r, g_r = compute_radial_distribution_function(coords, area, max_distance=max_dist, num_bins=num_bins)
+                if len(g_r) > 0:
+                    all_g_r.append(g_r)
+        
+        if all_g_r:
+            avg_g_r = np.mean(all_g_r, axis=0)
+            # Optional: Calculate standard error for confidence intervals
+            std_err = np.std(all_g_r, axis=0) / np.sqrt(len(all_g_r))
+            
+            plt.plot(r, avg_g_r, label=group, color=colors[idx], linewidth=2.5)
+            plt.fill_between(r, avg_g_r - std_err, avg_g_r + std_err, color=colors[idx], alpha=0.2)
+
+    # Add the Random Distribution Baseline
+    plt.axhline(1.0, color='black', linestyle='--', linewidth=2, label='Random (Uniform)')
+    
+    plot_title = title if title else f"Local Spatial Clustering: {coords_col.split('_')[0]}"
+    plt.title(plot_title, pad=20, fontweight='bold')
+    plt.xlabel("Distance between objects ($\mu m$)", fontweight='bold')
+    plt.ylabel("Radial Distribution Function $g(r)$", fontweight='bold')
+    
+    plt.legend(frameon=False)
+    sns.despine(trim=True, offset=5)
+    plt.tight_layout()
+    
+    if save_filename:
+        plt.savefig(f"{save_filename}.svg", format='svg', dpi=300)
+    
+    plt.show()
